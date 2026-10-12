@@ -66,6 +66,11 @@ func newTestCrdClient(reaction func(_ k8sTesting.Action) (bool, runtime.Object, 
 	}
 }
 
+// newTestDynamicClient - returns a fake dynamic client that can list and watch Events
+func newTestDynamicClient() *dynamicFake.FakeDynamicClient {
+	return dynamicFake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{eventsGvr: "EventList"})
+}
+
 // This test (test-harness) exercises the kubewatcher from the client perspective
 // - start a kubewatcher
 // - force a k8s event in the system
@@ -82,7 +87,7 @@ func Test_bigPicture(t *testing.T) {
 	kubeContext := "" // empty string makes things work
 	enableGranularMetrics := true
 	exclusionRules := map[string][]any{}
-	kw, err := NewKubeWatcherSource(kubeClient, outChan, resync, includeCrds, time.Duration(10*time.Second), masterURL, kubeContext, enableGranularMetrics, exclusionRules)
+	kw, err := NewKubeWatcherSource(kubeClient, newTestDynamicClient(), outChan, resync, includeCrds, time.Duration(10*time.Second), masterURL, kubeContext, enableGranularMetrics, exclusionRules)
 	assert.NoError(t, err)
 
 	// create service and await corresponding event
@@ -125,7 +130,7 @@ func Test_bigPictureWithExclusionRules(t *testing.T) {
 		},
 	}
 
-	kw, err := NewKubeWatcherSource(kubeClient, outChan, resync, includeCrds, time.Duration(10*time.Second), masterURL, kubeContext, enableGranularMetrics, exclusionRules)
+	kw, err := NewKubeWatcherSource(kubeClient, newTestDynamicClient(), outChan, resync, includeCrds, time.Duration(10*time.Second), masterURL, kubeContext, enableGranularMetrics, exclusionRules)
 	assert.NoError(t, err)
 
 	// create namespace

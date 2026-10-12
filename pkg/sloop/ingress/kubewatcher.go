@@ -12,7 +12,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,7 +27,9 @@ import (
 	"github.com/salesforce/sloop/pkg/sloop/kubeextractor"
 	"github.com/salesforce/sloop/pkg/sloop/store/typed"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -59,8 +60,9 @@ type crdInformerInfo struct {
 }
 
 type kubeWatcherImpl struct {
-	informerFactory informers.SharedInformerFactory
-	stopChan        chan struct{}
+	informerFactory      informers.SharedInformerFactory
+	eventInformerFactory dynamicinformer.DynamicSharedInformerFactory
+	stopChan             chan struct{}
 
 	crdInformers      map[crdGroupVersionResourceKind]*crdInformerInfo
 	activeCrdInformer int64
@@ -74,6 +76,14 @@ type kubeWatcherImpl struct {
 	exclusionRules map[string][]any
 }
 
+// Events are watched with a dynamic (unstructured) informer instead of the typed corev1.Event informer.
+// A typed informer decodes the response into corev1.Event, and encoding/json silently drops every field that
+// is not in that struct. Some servers return Events on /api/v1 with the events.k8s.io/v1 field names
+// (regarding, note, deprecatedCount, ...), which would be stored with an empty involvedObject and a count of 0,
+// so they never show up in the event heatmap or in a resource's Events panel. Unstructured keeps all fields and
+// normalizeEvent maps them to the core/v1 names Sloop reads.
+var eventsGvr = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "events"}
+
 var (
 	newCrdClient                        = func(kubeCfg *rest.Config) (clientset.Interface, error) { return clientset.NewForConfig(kubeCfg) }
 	metricIngressGranularKubewatchcount = promauto.NewCounterVec(prometheus.CounterOpts{Name: "metric_ingress_event_kubewatchcount"}, []string{"namespace", "name", "kind", "reason", "type"})
@@ -84,14 +94,14 @@ var (
 )
 
 // Todo: Add additional parameters for filtering
-func NewKubeWatcherSource(kubeClient kubernetes.Interface, outChan chan typed.KubeWatchResult, resync time.Duration, includeCrds bool, crdRefreshInterval time.Duration, masterURL string, kubeContext string, enableGranularMetrics bool, exclusionRules map[string][]any) (KubeWatcher, error) {
+func NewKubeWatcherSource(kubeClient kubernetes.Interface, dynamicClient dynamic.Interface, outChan chan typed.KubeWatchResult, resync time.Duration, includeCrds bool, crdRefreshInterval time.Duration, masterURL string, kubeContext string, enableGranularMetrics bool, exclusionRules map[string][]any) (KubeWatcher, error) {
 	kw := &kubeWatcherImpl{resync: resync, protection: &sync.Mutex{}}
 	kw.stopChan = make(chan struct{})
 	kw.crdInformers = make(map[crdGroupVersionResourceKind]*crdInformerInfo)
 	kw.outchan = outChan
 	kw.exclusionRules = exclusionRules
 
-	kw.startWellKnownInformers(kubeClient, enableGranularMetrics)
+	kw.startWellKnownInformers(kubeClient, dynamicClient, enableGranularMetrics)
 	if includeCrds {
 		err := kw.startCustomInformers(masterURL, kubeContext, enableGranularMetrics)
 		if err != nil {
@@ -105,8 +115,9 @@ func NewKubeWatcherSource(kubeClient kubernetes.Interface, outChan chan typed.Ku
 	return kw, nil
 }
 
-func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interface, enableGranularMetrics bool) {
+func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interface, dynamicClient dynamic.Interface, enableGranularMetrics bool) {
 	i.informerFactory = informers.NewSharedInformerFactory(kubeclient, i.resync)
+	i.eventInformerFactory = dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, i.resync)
 
 	i.informerFactory.Apps().V1().DaemonSets().Informer().AddEventHandler(i.getEventHandlerForResource("DaemonSet", enableGranularMetrics))
 	i.informerFactory.Apps().V1().Deployments().Informer().AddEventHandler(i.getEventHandlerForResource("Deployment", enableGranularMetrics))
@@ -114,7 +125,8 @@ func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interfac
 	i.informerFactory.Apps().V1().StatefulSets().Informer().AddEventHandler(i.getEventHandlerForResource("StatefulSet", enableGranularMetrics))
 	i.informerFactory.Core().V1().ConfigMaps().Informer().AddEventHandler(i.getEventHandlerForResource("ConfigMap", enableGranularMetrics))
 	i.informerFactory.Core().V1().Endpoints().Informer().AddEventHandler(i.getEventHandlerForResource("Endpoint", enableGranularMetrics))
-	i.informerFactory.Core().V1().Events().Informer().AddEventHandler(i.getEventHandlerForResource("Event", enableGranularMetrics))
+	// Not i.informerFactory.Core().V1().Events(): see eventsGvr
+	i.eventInformerFactory.ForResource(eventsGvr).Informer().AddEventHandler(i.getEventHandlerForResource("Event", enableGranularMetrics))
 	i.informerFactory.Autoscaling().V1().HorizontalPodAutoscalers().Informer().AddEventHandler(i.getEventHandlerForResource("HorizontalPodAutoscaler", enableGranularMetrics))
 	i.informerFactory.Batch().V1().Jobs().Informer().AddEventHandler(i.getEventHandlerForResource("Job", enableGranularMetrics))
 	i.informerFactory.Core().V1().Namespaces().Informer().AddEventHandler(i.getEventHandlerForResource("Namespace", enableGranularMetrics))
@@ -128,6 +140,7 @@ func (i *kubeWatcherImpl) startWellKnownInformers(kubeclient kubernetes.Interfac
 	i.informerFactory.Storage().V1().StorageClasses().Informer().AddEventHandler(i.getEventHandlerForResource("StorageClass", enableGranularMetrics))
 	i.informerFactory.Admissionregistration().V1().MutatingWebhookConfigurations().Informer().AddEventHandler(i.getEventHandlerForResource("MutatingWebhookConfiguration", enableGranularMetrics))
 	i.informerFactory.Start(i.stopChan)
+	i.eventInformerFactory.Start(i.stopChan)
 }
 
 func (i *kubeWatcherImpl) startCustomInformers(masterURL string, kubeContext string, enableGranularMetrics bool) error {
@@ -304,6 +317,11 @@ func (i *kubeWatcherImpl) reportUpdate(kind string, enableGranularMetrics bool) 
 }
 
 func (i *kubeWatcherImpl) processUpdate(kind string, obj interface{}, watchResult *typed.KubeWatchResult, enableGranularmetrics bool) {
+	// Rewrite events.k8s.io/v1 shaped Events to core/v1 before they are stored, so kubeextractor
+	// (count, timestamps, involvedObject), the event count table and the UI can read them
+	if event, ok := obj.(*unstructured.Unstructured); ok && kind == "Event" {
+		obj = normalizeEvent(event)
+	}
 	resourceJson, err := i.getResourceAsJsonString(kind, obj)
 	if err != nil {
 		glog.Error(err)
@@ -313,7 +331,12 @@ func (i *kubeWatcherImpl) processUpdate(kind string, obj interface{}, watchResul
 
 	eventExcluded := i.eventExcluded(kind, resourceJson)
 	if eventExcluded {
-		objName := reflect.ValueOf(obj).Elem().FieldByName("ObjectMeta").FieldByName("Name")
+		// meta.Accessor works for typed and unstructured objects (Events and CRDs); reflecting on an
+		// ObjectMeta field panics for *unstructured.Unstructured
+		objName := ""
+		if accessor, err := meta.Accessor(obj); err == nil {
+			objName = accessor.GetName()
+		}
 		glog.V(2).Infof("Event for object excluded: %s/%s", kind, objName)
 		return
 	}

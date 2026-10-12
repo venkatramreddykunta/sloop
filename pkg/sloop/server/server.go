@@ -103,8 +103,13 @@ func RealMain() error {
 		if err != nil {
 			return errors.Wrap(err, "failed to create kubernetes client")
 		}
+		// Used to watch Events as unstructured objects, built from the same config as kubeClient
+		dynamicClient, err := ingress.MakeDynamicClient(conf.ApiServerHost, kubeContext, conf.PrivilegedAccess)
+		if err != nil {
+			return errors.Wrap(err, "failed to create kubernetes dynamic client")
+		}
 
-		kubeWatcherSource, err = ingress.NewKubeWatcherSource(kubeClient, kubeWatchChan, conf.KubeWatchResyncInterval, conf.WatchCrds, conf.CrdRefreshInterval, conf.ApiServerHost, kubeContext, conf.EnableGranularMetrics, conf.ExclusionRules)
+		kubeWatcherSource, err = ingress.NewKubeWatcherSource(kubeClient, dynamicClient, kubeWatchChan, conf.KubeWatchResyncInterval, conf.WatchCrds, conf.CrdRefreshInterval, conf.ApiServerHost, kubeContext, conf.EnableGranularMetrics, conf.ExclusionRules)
 		if err != nil {
 			return errors.Wrap(err, "failed to initialize kubeWatcher")
 		}

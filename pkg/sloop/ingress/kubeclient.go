@@ -9,6 +9,7 @@ package ingress
 
 import (
 	"github.com/golang/glog"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/azure"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -49,20 +50,9 @@ func GetKubernetesContext(masterURL string, kubeContextPreference string, privil
 // and returns a K8s client
 func MakeKubernetesClient(masterURL string, kubeContext string, privilegedAccess bool) (kubernetes.Interface, error) {
 	glog.Infof("Creating k8sclient with user-defined config masterURL=%v, kubeContext=%v.", masterURL, kubeContext)
-	var config *rest.Config
-	var err error
-	if privilegedAccess {
-		clientConfig := getConfig(masterURL, kubeContext)
-		config, err = ClientConfig(clientConfig)
-		glog.Infof("Building k8sclient with context=%v, masterURL=%v, configFile=%v.", kubeContext, config.Host, clientConfig.ConfigAccess().GetLoadingPrecedence())
-	} else {
-		glog.Infof("Creating Config using BuildConfigFromFlags")
-		config, err = BuildConfigFromFlags(masterURL, "")
-		if err != nil {
-			glog.Errorf("Cannot create config using BuildConfigFromFlags")
-			return nil, err
-		}
-		glog.Infof("Building k8sclient with context=%v, masterURL=%v.", kubeContext, config.Host)
+	config, err := makeRestConfig(masterURL, kubeContext, privilegedAccess)
+	if err != nil {
+		return nil, err
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -73,6 +63,42 @@ func MakeKubernetesClient(masterURL string, kubeContext string, privilegedAccess
 
 	glog.Infof("Created k8sclient with above configurations")
 	return clientset, nil
+}
+
+// MakeDynamicClient returns a dynamic client built from the same config as MakeKubernetesClient
+func MakeDynamicClient(masterURL string, kubeContext string, privilegedAccess bool) (dynamic.Interface, error) {
+	config, err := makeRestConfig(masterURL, kubeContext, privilegedAccess)
+	if err != nil {
+		return nil, err
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		glog.Errorf("Cannot Initialize Kubernetes Dynamic Client API: %v", err)
+		return nil, err
+	}
+	return dynamicClient, nil
+}
+
+func makeRestConfig(masterURL string, kubeContext string, privilegedAccess bool) (*rest.Config, error) {
+	if privilegedAccess {
+		clientConfig := getConfig(masterURL, kubeContext)
+		config, err := ClientConfig(clientConfig)
+		if err != nil {
+			return nil, err
+		}
+		glog.Infof("Building k8sclient with context=%v, masterURL=%v, configFile=%v.", kubeContext, config.Host, clientConfig.ConfigAccess().GetLoadingPrecedence())
+		return config, nil
+	}
+
+	glog.Infof("Creating Config using BuildConfigFromFlags")
+	config, err := BuildConfigFromFlags(masterURL, "")
+	if err != nil {
+		glog.Errorf("Cannot create config using BuildConfigFromFlags")
+		return nil, err
+	}
+	glog.Infof("Building k8sclient with context=%v, masterURL=%v.", kubeContext, config.Host)
+	return config, nil
 }
 
 func getConfig(masterURL string, kubeContext string) clientcmd.ClientConfig {
